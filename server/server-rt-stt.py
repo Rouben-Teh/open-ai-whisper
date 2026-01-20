@@ -1,5 +1,5 @@
 import json
-from fastapi import FastAPI, UploadFile, File, WebSocket
+from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect
 from pydub import AudioSegment
 import numpy as np
 import io
@@ -8,6 +8,8 @@ import uvicorn
 import queue
 import threading
 import time
+from collections import defaultdict
+from datetime import datetime
 
 # ===== 参数 =====
 SAMPLE_RATE = 16000
@@ -24,6 +26,30 @@ model = WhisperModel(
 )
 
 app = FastAPI()
+
+# ===== Connection Manager for Multi-User Support =====
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: dict[str, WebSocket] = {}
+        self.lock = threading.Lock()
+    
+    async def connect(self, websocket: WebSocket, client_id: str):
+        await websocket.accept()
+        with self.lock:
+            self.active_connections[client_id] = websocket
+        print(f"✓ Client {client_id} connected. Active connections: {len(self.active_connections)}")
+    
+    def disconnect(self, client_id: str):
+        with self.lock:
+            if client_id in self.active_connections:
+                del self.active_connections[client_id]
+        print(f"✗ Client {client_id} disconnected. Active connections: {len(self.active_connections)}")
+    
+    def get_active_count(self) -> int:
+        with self.lock:
+            return len(self.active_connections)
+
+manager = ConnectionManager()
 
 @app.post("/transcribe")
 async def transcribe_audio(file: UploadFile = File(...)):
@@ -46,7 +72,7 @@ async def transcribe_audio(file: UploadFile = File(...)):
     # Transcribe using Whisper
     segments, _ = model.transcribe(
         samples,
-        language="zh",
+        language="en",
         beam_size=1,
         vad_filter=True,
         condition_on_previous_text=False
@@ -57,134 +83,172 @@ async def transcribe_audio(file: UploadFile = File(...)):
     
     return {"text": text}
 
+@app.get("/status")
+async def get_status():
+    """Monitor active WebSocket connections"""
+    return {
+        "active_connections": manager.get_active_count(),
+        "timestamp": datetime.now().isoformat()
+    }
+
 @app.websocket("/ws/transcribe")
 async def websocket_transcribe(websocket: WebSocket):
-    await websocket.accept()
-    
-    auto_cut = False
-    cut = False
-    silence_duration = 2.0
-    last_audio_time = time.time()
-
-    audio_buffer = []
-    total_audio_seconds = 0.0
-    transcribed_segments = []
-    
-    audio_queue = queue.Queue()
-    message_queue = queue.Queue()  # Queue for sending messages from thread to async context
-    stop_event = threading.Event()
-    
-    def transcriber():
-        nonlocal auto_cut, cut, silence_duration, last_audio_time, audio_buffer, total_audio_seconds
-        while not stop_event.is_set():
-            try:
-                data = audio_queue.get(timeout=0.1)
-                audio_buffer.append(data)
-                
-                total_frames = sum(len(b) for b in audio_buffer)
-                
-                if total_frames >= CHUNK_FRAMES:
-                    total_audio_seconds += CHUNK_SECONDS
-                    audio_data = np.concatenate(audio_buffer)[-CHUNK_FRAMES:]
-                    audio_data = audio_data.flatten().astype(np.float32)
-                    audio_buffer = []
-                    
-                    segments, _ = model.transcribe(
-                        audio_data,
-                        language="zh",
-                        beam_size=1,
-                        vad_filter=True,
-                        condition_on_previous_text=False
-                    )
-
-                    segments = list(segments)
-
-                    if len(segments) == 0:
-                        print("Silence detected")
-                        silence_duration += CHUNK_SECONDS
-                    else:
-                        print("Speech detected")
-                        silence_duration = 0
-                        cut = False
-
-                        for s in segments:
-                            print(s.start," ",s.end," ",s.text)
-                            transcribed_segments.append(s.text)
-
-                    # # 滑动窗口，保留最近 1 秒
-                    # keep_frames = SAMPLE_RATE * 1
-                    # audio_buffer = [audio_data[-keep_frames:]]
-
-                if len(transcribed_segments) > 0 and auto_cut:
-                    if(silence_duration >= 2.0 and not cut):
-                        print("Auto cut triggered")
-                        full_text = "".join(transcribed_segments)
-                        # Put message in queue instead of calling async method directly
-                        message_queue.put({
-                            "type": "auto_cut",
-                            "text": full_text
-                        })
-                        transcribed_segments.clear()
-                        cut = True
-                    
-            except queue.Empty:
-                continue
-    
-    transcriber_thread = threading.Thread(target=transcriber)
-    transcriber_thread.start()
+    client_id = None
     
     try:
-        while True:
-            msg = await websocket.receive()
-
-            # ===== 音频数据 =====
-            if msg.get("bytes") is not None:
-                audio_chunk = np.frombuffer(msg["bytes"], dtype=np.float32)
-                audio_queue.put(audio_chunk)
-
-            # ===== 正常结束信号 =====
-            elif msg.get("text") is not None:
-                text = msg["text"]
-
-                # STOP
-                if text == "STOP":
-                    print("Received STOP signal")
-                    break
-
-                # JSON 消息
-                try:
-                    data = json.loads(text)
-                except json.JSONDecodeError:
-                    continue
-
-                if data.get("type") == "config":
-                    auto_cut = bool(data.get("auto_cut", False))
-                    print("auto_cut:", auto_cut)
-            
-            # ===== Check for messages from transcriber thread =====
+        # Accept connection FIRST
+        await websocket.accept()
+        
+        # Wait for initial message with uid from client
+        msg = await websocket.receive()
+        
+        if msg.get("text") is not None:
             try:
-                while True:
-                    queued_msg = message_queue.get_nowait()
-                    await websocket.send_json(queued_msg)
-            except queue.Empty:
+                data = json.loads(msg["text"])
+                client_id = data.get("uid")
+            except json.JSONDecodeError:
+                client_id = None
+        
+        # Validate client_id
+        if not client_id or not isinstance(client_id, str):
+            await websocket.send_json({"type": "error", "message": "Invalid or missing uid. Send first message: {\"uid\": \"your_user_id\"}"})
+            await websocket.close()
+            return
+        
+        # Register connection in manager (don't call accept again)
+        with manager.lock:
+            manager.active_connections[client_id] = websocket
+        print(f"✓ Client {client_id} connected. Active connections: {len(manager.active_connections)}")
+        
+        auto_cut = False
+        cut = False
+        silence_duration = 2.0
+        last_audio_time = time.time()
+
+        audio_buffer = []
+        total_audio_seconds = 0.0
+        transcribed_segments = []
+        
+        audio_queue = queue.Queue()
+        message_queue = queue.Queue()
+        stop_event = threading.Event()
+        
+        def transcriber():
+            nonlocal auto_cut, cut, silence_duration, last_audio_time, audio_buffer, total_audio_seconds
+            while not stop_event.is_set():
+                try:
+                    data = audio_queue.get(timeout=0.1)
+                    audio_buffer.append(data)
+                    
+                    total_frames = sum(len(b) for b in audio_buffer)
+                    
+                    if total_frames >= CHUNK_FRAMES:
+                        total_audio_seconds += CHUNK_SECONDS
+                        audio_data = np.concatenate(audio_buffer)[-CHUNK_FRAMES:]
+                        audio_data = audio_data.flatten().astype(np.float32)
+                        audio_buffer = []
+                        
+                        segments, _ = model.transcribe(
+                            audio_data,
+                            language="en",
+                            beam_size=1,
+                            vad_filter=True,
+                            condition_on_previous_text=False
+                        )
+
+                        segments = list(segments)
+
+                        if len(segments) == 0:
+                            # print(f"[{client_id}] Silence detected")
+                            silence_duration += CHUNK_SECONDS
+                        else:
+                            print(f"[{client_id}] Speech detected")
+                            silence_duration = 0
+                            cut = False
+
+                            for s in segments:
+                                print(f"[{client_id}] {s.start} {s.end} {s.text}")
+                                transcribed_segments.append(s.text)
+
+                    if len(transcribed_segments) > 0 and auto_cut:
+                        if(silence_duration >= 2.0 and not cut):
+                            print(f"[{client_id}] Auto cut triggered")
+                            full_text = "".join(transcribed_segments)
+                            message_queue.put({
+                                "type": "auto_cut",
+                                "text": full_text
+                            })
+                            transcribed_segments.clear()
+                            cut = True
+                        
+                except queue.Empty:
+                    continue
+        
+        transcriber_thread = threading.Thread(target=transcriber, daemon=True)
+        transcriber_thread.start()
+        
+        try:
+            while True:
+                msg = await websocket.receive()
+
+                # ===== 音频数据 =====
+                if msg.get("bytes") is not None:
+                    audio_chunk = np.frombuffer(msg["bytes"], dtype=np.float32)
+                    audio_queue.put(audio_chunk)
+
+                # ===== 正常结束信号 =====
+                elif msg.get("text") is not None:
+                    text = msg["text"]
+
+                    # STOP
+                    if text == "STOP":
+                        print(f"[{client_id}] Received STOP signal")
+                        break
+
+                    # JSON 消息
+                    try:
+                        data = json.loads(text)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if data.get("type") == "config":
+                        auto_cut = bool(data.get("auto_cut", False))
+                        print(f"[{client_id}] auto_cut: {auto_cut}")
+                
+                # ===== Check for messages from transcriber thread =====
+                try:
+                    while True:
+                        queued_msg = message_queue.get_nowait()
+                        await websocket.send_json(queued_msg)
+                except queue.Empty:
+                    pass
+
+        except WebSocketDisconnect:
+            print(f"[{client_id}] WebSocket disconnected")
+        except Exception as e:
+            print(f"[{client_id}] WebSocket error: {e}")
+        finally:
+            stop_event.set()
+            transcriber_thread.join(timeout=5)
+            full_text = "".join(transcribed_segments)
+
+            try:
+                await websocket.send_json({
+                    "type": "final",
+                    "text": full_text
+                })
+            except Exception:
                 pass
 
-    except Exception as e:
-        print(f"WebSocket error: {e}")
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+    
     finally:
-        stop_event.set()
-        transcriber_thread.join(timeout=5)
-        full_text = "".join(transcribed_segments)
-
-        try:
-            await websocket.send_json({
-                "type": "final",
-                "text": full_text
-            })
-        except Exception:
-            pass
-
-        await websocket.close()
+        # Always disconnect from manager if connected
+        if client_id:
+            manager.disconnect(client_id)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8001)
