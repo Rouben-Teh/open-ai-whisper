@@ -101,6 +101,8 @@ async def websocket_transcribe(websocket: WebSocket):
         
         # Wait for initial message with uid from client
         msg = await websocket.receive()
+
+        # print(f"Received initial message: {msg}")
         
         if msg.get("text") is not None:
             try:
@@ -108,6 +110,12 @@ async def websocket_transcribe(websocket: WebSocket):
                 client_id = data.get("uid")
             except json.JSONDecodeError:
                 client_id = None
+        # elif msg.get("bytes") is not None:
+        #     try:
+        #         data = json.loads(msg["bytes"].decode("utf-8"))
+        #         client_id = data.get("uid")
+        #     except json.JSONDecodeError:
+        #         data = None  # 不是 JSON（可能是音频）
         
         # Validate client_id
         if not client_id or not isinstance(client_id, str):
@@ -190,7 +198,7 @@ async def websocket_transcribe(websocket: WebSocket):
         try:
             while True:
                 msg = await websocket.receive()
-
+                # print(f"[{client_id}] Received message: {msg}")
                 # ===== 音频数据 =====
                 if msg.get("bytes") is not None:
                     audio_chunk = np.frombuffer(msg["bytes"], dtype=np.float32)
@@ -214,6 +222,7 @@ async def websocket_transcribe(websocket: WebSocket):
                     if data.get("type") == "config":
                         auto_cut = bool(data.get("auto_cut", False))
                         print(f"[{client_id}] auto_cut: {auto_cut}")
+                        await websocket.send_json({"type": "ready"})
                 
                 # ===== Check for messages from transcriber thread =====
                 try:
